@@ -385,6 +385,137 @@ def heat_exposure(
     )
 
 
+def _time_weighted_temperature_median(
+    valid_segments: list[tuple[Fraction, Fraction, int]],
+) -> tuple[float | None, float]:
+    """计算“按时间持续加权”的温度中位数与有效总时长。
+
+    每段为 (起点温度, 终点温度, 校正后整数微秒时长)，时长均 > 0。
+    段内温度在两端之间按时间线性变化，故时长在温度上是均匀分布；
+    恒温段（两端温度相同）退化为该温度上的点质量（atom）。
+
+    中位数定义为：累计时长占比首次达到一半（>= 总时长 / 2）的**最低温度**，
+    即该混合分布的 CDF 取下侧广义逆。全程用 Fraction 精确计算
+    （温度与微秒时长均可无损转为有理数），避免在半总时长边界上因浮点误差选错点。
+
+    做法：收集所有端点温度作为断点；在每个断点处汇总恒温点质量与
+    开区间密度（微秒/℃）的净变化（密度 = 段时长 / 温度跨度），然后从低到高扫描：
+    先累计当前温度的点质量，再按均匀密度跨过它到下一断点。
+    返回 (中位数温度, 总秒数)；valid_segments 为空时返回 (None, 0.0)。
+    """
+    if not valid_segments:
+        return None, 0.0
+
+    # 断点温度 -> [点质量, 密度净变化]，键全部用 Fraction
+    point_mass: dict[Fraction, Fraction] = {}
+    density_delta: dict[Fraction, Fraction] = {}
+    breaks: set[Fraction] = set()
+    total = Fraction(0)
+
+    def _add(target: dict[Fraction, Fraction], key: Fraction, value: Fraction) -> None:
+        target[key] = target.get(key, Fraction(0)) + value
+
+    for t0_f, t1_f, d in valid_segments:
+        total += d
+        breaks.add(t0_f)
+        breaks.add(t1_f)
+        if t0_f == t1_f:
+            # 恒温段：整段时长作为该温度的点质量
+            _add(point_mass, t0_f, Fraction(d))
+        elif t0_f < t1_f:
+            # 升温段：时长 d 在 [t0, t1] 上均匀，密度为 d/(t1-t0)（微秒/℃）
+            density = Fraction(d) / (t1_f - t0_f)
+            _add(density_delta, t0_f, density)
+            _add(density_delta, t1_f, -density)
+        else:
+            # 降温段：时长 d 在 [t1, t0] 上均匀，密度同样为 d/(t0-t1)
+            density = Fraction(d) / (t0_f - t1_f)
+            _add(density_delta, t1_f, density)
+            _add(density_delta, t0_f, -density)
+
+    ordered = sorted(breaks)
+    half = total / 2
+    cumulative = Fraction(0)
+    rho = Fraction(0)  # 当前断点右侧开区间内的温度密度（微秒/℃）
+    median: Fraction | None = None
+    for idx, x in enumerate(ordered):
+        # 1) 该温度处：先并入进入此断点的密度净变化（首个断点为 +密度），
+        #    再统计恒温点质量
+        rho += density_delta.get(x, Fraction(0))
+        mass = point_mass.get(x, Fraction(0))
+        if mass > 0 and cumulative + mass >= half:
+            median = x
+            break
+        cumulative += mass
+        # 2) 跨过开区间 (x, next_break)，密度恒定为 rho
+        if idx + 1 >= len(ordered):
+            break  # 末断点右侧无任何分布
+        nxt = ordered[idx + 1]
+        if rho > 0:
+            need = half - cumulative
+            span = rho * (nxt - x)
+            if span >= need:
+                median = x + need / rho
+                break
+            cumulative += span
+        # rho == 0：两断点间没有有效分布，直接越过，不累计时长
+
+    assert median is not None  # 累计到最高断点必达 half
+    return float(median), float(total) / 1_000_000.0
+
+
+def temperature_median(
+    db: Session,
+    box_code: str,
+    seq_from: int,
+    seq_to: int,
+    max_gap_seconds: float,
+) -> schemas.TemperatureMedianResult | None:
+    """区间内按持续时间加权的温度中位数，基于 clock-audit 同款校正时间。
+
+    - 相邻事件（按 seq 升序，缺号不补点）间温度视为线性变化，把每个有效段
+      的每一瞬间按其持续时间计入温度分布；恒温段的整段时长是该温度的点质量
+    - 事件时间先按等权保序回归校正；校正后间隔为零（同一合并块）或超过
+      max_gap_seconds 的段不计入分布（以 skipped_segment_count 计数）
+    - 中位数取累计时长占比首次达到一半的最低温度；没有有效段时
+      median_temperature=None、total_seconds=0.0
+    - 只在查询时即时计算，不改动任何原始记录；补报后重查即重算
+    - 箱号不存在返回 None，由路由层转 404；区间无事件返回空结果
+    """
+    events = _events_in_range(db, box_code, seq_from, seq_to)
+    if events is None:
+        return None
+
+    corrected, _ = _isotonic_suggestions(events)
+
+    valid_segments: list[tuple[Fraction, Fraction, int]] = []
+    skipped = 0
+    for i in range(len(events) - 1):
+        gap_micros = corrected[i + 1] - corrected[i]
+        gap_seconds = gap_micros / 1_000_000
+        # 校正时间非递减，间隔只会 >= 0；为 0（同块）或超上限的段不计入
+        if gap_micros <= 0 or gap_seconds > max_gap_seconds:
+            skipped += 1
+            continue
+        valid_segments.append(
+            (Fraction(events[i].temperature), Fraction(events[i + 1].temperature), gap_micros)
+        )
+
+    median_temperature, total_seconds = _time_weighted_temperature_median(valid_segments)
+
+    return schemas.TemperatureMedianResult(
+        box_code=box_code,
+        seq_from=seq_from,
+        seq_to=seq_to,
+        max_gap_seconds=max_gap_seconds,
+        event_count=len(events),
+        segment_count=len(valid_segments),
+        skipped_segment_count=skipped,
+        total_seconds=total_seconds,
+        median_temperature=median_temperature,
+    )
+
+
 def _compress_trajectory(
     xs: list[int], ys: list[float], max_error: float
 ) -> tuple[list[int], Fraction]:

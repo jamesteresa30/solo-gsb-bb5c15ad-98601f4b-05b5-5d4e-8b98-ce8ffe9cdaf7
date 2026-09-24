@@ -19,7 +19,7 @@
 │   ├── database.py        # 引擎/会话，启动建表
 │   ├── models.py          # BoxEvent 模型，(box_code, seq) 唯一约束
 │   ├── schemas.py         # 请求/响应模型与时间归一化
-│   ├── services.py        # 幂等去重、冲突判定、最新状态查询、保序回归时钟校正、超温积分、轨迹压缩预览
+│   ├── services.py        # 幂等去重、冲突判定、最新状态查询、保序回归时钟校正、超温积分、时间加权温度中位数、轨迹压缩预览
 │   └── main.py            # FastAPI 路由
 ├── Dockerfile
 ├── docker-compose.yml
@@ -95,6 +95,7 @@ APP_PORT=9000 docker compose up -d --build
 | GET  | `/boxes/{box_code}/events`    | 单个箱子的全部事件（按序号升序）       |
 | GET  | `/boxes/{box_code}/clock-audit` | 区间事件的设备时钟回拨校正建议（保序回归，不改原始记录） |
 | GET  | `/boxes/{box_code}/heat-exposure` | 区间事件的超温积分（℃·秒，线性插值 + 保序校正时间，不改原始记录） |
+| GET  | `/boxes/{box_code}/temperature-median` | 区间按持续时间加权的温度中位数（线性插值 + 保序校正时间，不改原始记录） |
 | GET  | `/boxes/{box_code}/trajectory-compression` | 区间温度轨迹压缩预览（最少保留点 + 线性插值误差受限，只读不写回） |
 
 ### 上报事件
@@ -356,6 +357,98 @@ curl -i 'http://localhost:8000/boxes/BOX-HEAT/heat-exposure?seq_from=5&seq_to=2&
 curl -i 'http://localhost:8000/boxes/BOX-HEAT/heat-exposure?seq_from=0&seq_to=3&upper_limit=-2&max_gap_seconds=0'
 ```
 
+## 时间加权温度中位数（temperature-median）
+
+`GET /boxes/{box_code}/temperature-median`（默认访问端口 **8000**，
+如 `http://localhost:8000/boxes/BOX-MED/temperature-median`）返回指定序号区间内
+**按持续时间加权的温度中位数**与有效总秒数：
+
+- 按 `seq` 升序取闭区间 `[seq_from, seq_to]` 内事件，事件时间沿用 clock-audit 的
+  **等权保序回归校正**（只读即时计算，不改原始记录；乱序补报后重查即自动重算）。
+- 相邻两条事件（**缺号不补点**，序号可以跳号）之间温度视为**随时间线性变化**，
+  把每个有效段的**每一瞬间按其持续时间**计入温度分布：
+  - 两端温度不同的段，时长在该温度区间上**均匀分布**；
+  - **恒温段**的整段时长作为该温度上的**点质量**（离散原子）。
+- 仅纳入校正后时长**大于 0 且不超过 `max_gap_seconds`** 的段；间隔为零
+  （同一合并块）或超过上限的段不计入（以 `skipped_segment_count` 计数）。
+- `median_temperature` 取**累计时长占比首次达到一半（≥ 1/2）的最低温度**
+  （即分布函数的下侧广义逆；并列时取低温侧）。全程用精确有理数计算，
+  半总时长边界上的并列不会因浮点误差选错点。
+- **没有任何有效段**（区间无事件、只有一条事件、或全部段都被过滤）时
+  `median_temperature = null`、`total_seconds = 0.0`。
+- 箱号不存在返回 `404`；参数非法返回 `422`。
+
+查询参数：
+
+- `seq_from` / `seq_to`：序号区间，**均为整数且含端点**，必须 `>= 0` 且 `seq_from <= seq_to`。
+- `max_gap_seconds`：允许计入的最大相邻校正间隔（秒），**必须为正数**（有限数值）。
+
+返回字段：
+
+| 字段                      | 说明                                                       |
+| ------------------------- | ---------------------------------------------------------- |
+| `event_count`             | 区间内事件条数                                             |
+| `segment_count`           | 计入分布的有效段数（校正后时长 > 0 且 ≤ `max_gap_seconds`） |
+| `skipped_segment_count`   | 因校正后间隔为零或超过 `max_gap_seconds` 而未计入的段数    |
+| `total_seconds`           | 各有效段校正后时长合计（秒）；无有效段为 `0.0`             |
+| `median_temperature`      | 累计占比首次达到一半的最低温度（℃）；无有效段为 `null`     |
+
+```bash
+# 先上报：seq=0/1 设备时钟回拨（00:10、00:00，校正后同为 00:05 -> 该段零间隔，不计入）；
+# seq=2 在 00:01:40 为 0℃；seq=3 在 00:03:40 为 10℃（缺号不补点，直接与 seq=5 相邻）；
+# seq=5 在 00:05:40 恒温 10℃
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-MED","seq":0,"temperature":0.0,"event_time":"2026-09-24T00:00:10+00:00"}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-MED","seq":1,"temperature":4.0,"event_time":"2026-09-24T00:00:00+00:00"}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-MED","seq":2,"temperature":0.0,"event_time":"2026-09-24T00:01:40+00:00"}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-MED","seq":3,"temperature":10.0,"event_time":"2026-09-24T00:03:40+00:00"}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-MED","seq":5,"temperature":10.0,"event_time":"2026-09-24T00:05:40+00:00"}'
+
+# 查询 0..5、最大间隔 120 秒
+curl 'http://localhost:8000/boxes/BOX-MED/temperature-median?seq_from=0&seq_to=5&max_gap_seconds=120'
+```
+
+响应（seq=0、1 校正后同刻，段 0→1 零间隔跳过；有效段为 95 秒 4→0、
+120 秒 0→10、120 秒恒温 10℃，合计 335 秒；累计一半落在升温段内的 6.0417℃）：
+
+```json
+{
+  "box_code": "BOX-MED",
+  "seq_from": 0,
+  "seq_to": 5,
+  "max_gap_seconds": 120.0,
+  "event_count": 5,
+  "segment_count": 3,
+  "skipped_segment_count": 1,
+  "total_seconds": 335.0,
+  "median_temperature": 6.041666666666667
+}
+```
+
+恒温段作为点质量的简化示例（100 秒恒温 0℃ + 200 秒线性 0→10℃，共 300 秒，
+一半即 150 秒：0℃ 点质量占 100 秒，剩余 50 秒在升温段内，对应 2.5℃）：
+
+```bash
+# 无有效段（区间无事件 / 只有一条事件 / 段全被过滤）-> median 为 null、总秒数为 0
+curl 'http://localhost:8000/boxes/BOX-MED/temperature-median?seq_from=100&seq_to=200&max_gap_seconds=120'
+# {"event_count":0,"segment_count":0,"skipped_segment_count":0,
+#  "total_seconds":0.0,"median_temperature":null, ...}
+
+# 间隔恰好等于 max_gap_seconds 计入；调小到 94 秒后所有段被过滤 -> null / 0
+curl 'http://localhost:8000/boxes/BOX-MED/temperature-median?seq_from=0&seq_to=5&max_gap_seconds=94'
+
+# 箱号不存在 -> 404
+curl -i 'http://localhost:8000/boxes/NO-SUCH-BOX/temperature-median?seq_from=0&seq_to=1&max_gap_seconds=120'
+
+# 参数非法（seq_from > seq_to、max_gap_seconds <= 0、NaN/Infinity、缺参数等）-> 422
+curl -i 'http://localhost:8000/boxes/BOX-MED/temperature-median?seq_from=5&seq_to=2&max_gap_seconds=120'
+curl -i 'http://localhost:8000/boxes/BOX-MED/temperature-median?seq_from=0&seq_to=3&max_gap_seconds=0'
+```
+
 ## 温度轨迹压缩预览（trajectory-compression）
 
 `GET /boxes/{box_code}/trajectory-compression`（默认访问端口 **8000**，
@@ -473,6 +566,13 @@ curl -i 'http://localhost:8000/boxes/BOX-CMP/trajectory-compression?seq_from=0&s
   温度视为线性变化，对超过 `upper_limit` 的部分解析求积（梯形/三角形公式），
   逐段积分用 `math.fsum` 精确求和；校正后间隔为零或超过 `max_gap_seconds` 的段
   直接跳过，缺号不补点。同样不写库，补报后重查即重算。
+- **时间加权中位数只读**：`temperature-median` 复用区间事件读取与同一套保序校正
+  时间，相邻事件间温度线性变化、每一瞬间按持续时间计入温度分布。变温段时长在其
+  温度区间上均匀（密度 = 段时长 / 温度跨度），恒温段时长是该温度的点质量；
+  实现上汇总各温度断点的点质量与密度净变化后从低到高扫描，累计时长首次达到
+  总时长一半时的最低温度即中位数。温度与微秒时长全程用 `Fraction` 精确计算，
+  占半并列时稳定落在低温侧；校正后间隔为零或超过 `max_gap_seconds` 的段不计入，
+  缺号不补点。查询不写库，乱序补报后重查即自动重算。
 - **轨迹压缩只读**：`trajectory-compression` 复用区间事件查询（按 `seq` 升序、
   缺号不补点），以序号为横坐标做最少保留点压缩。段 `(i,j)` 可行仅取决于两端点，
   因此问题等价于在“可行段”构成的 DAG 上求 0→n-1 的最短路径：用 DP 精确求解
