@@ -116,3 +116,25 @@ class HeatExposureResult(BaseModel):
     )
     total_celsius_seconds: float = Field(..., description="各段积分合计（℃·秒）")
     segments: list[HeatExposureSegment] = Field(..., description="计入积分的逐段明细")
+
+
+class TemperatureMedianResult(BaseModel):
+    box_code: str = Field(..., description="周转箱箱号")
+    seq_from: int = Field(..., description="查询起始序号（含）")
+    seq_to: int = Field(..., description="查询结束序号（含）")
+    max_gap_seconds: float = Field(..., description="允许计入的最大段时长（秒）")
+    event_count: int = Field(..., description="区间内事件条数")
+    segment_count: int = Field(..., description="计入分布的有效段数")
+    skipped_segment_count: int = Field(
+        ..., description="因校正后间隔为零或超过 max_gap_seconds 而未计入的段数"
+    )
+    total_seconds: float = Field(
+        ..., description="有效段校正后时长合计（秒）；无有效段时为 0.0"
+    )
+    median_temperature: float | None = Field(
+        ...,
+        description=(
+            "时间加权温度中位数（℃）：把有效段每一瞬间按持续时间计入温度分布后，"
+            "累计时间占比首次达到一半的最低温度；无有效段时为 null"
+        ),
+    )

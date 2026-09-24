@@ -1,4 +1,4 @@
-"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、超温积分、轨迹压缩预览。"""
+"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、超温积分、时间加权温度中位数、轨迹压缩预览。"""
 import math
 from datetime import datetime, timedelta, timezone
 from fractions import Fraction
@@ -382,6 +382,121 @@ def heat_exposure(
         skipped_segment_count=skipped,
         total_celsius_seconds=math.fsum(exposures),
         segments=segments,
+    )
+
+
+def _time_weighted_median(
+    segments: list[tuple[float, float, int]],
+) -> tuple[Fraction | None, int]:
+    """按段时长加权的温度中位数（精确有理数计算）。
+
+    入参 segments 为调用方筛出的有效段 (起点温度, 终点温度, 校正后时长微秒)，
+    时长均 > 0：
+
+    - 相邻事件间温度视为线性变化：
+      * 恒温段（两端温度相同）在该温度上贡献整段时长的点质量；
+      * 变温段在两端温度构成的开区间上贡献均匀密度（时长 / 温差），
+        端点本身没有点质量。
+    - 把每一瞬间按持续时间计入温度分布，返回“累计占比首次达到一半的最低温度”
+      （即广义逆 CDF 在 1/2 处的取值），以及有效总微秒数。
+
+    返回 (中位数温度（Fraction）, 有效总微秒)；无有效段时返回 (None, 0)。
+    温度来自有限 float，可无损转为 Fraction；时长为整数微秒，
+    故全程用 Fraction 精确计算，避免在“恰好一半”的边界上被浮点误差误判。
+    """
+    point_mass: dict[Fraction, int] = {}
+    delta: dict[Fraction, Fraction] = {}
+    total_micros = 0
+
+    for temp_from, temp_to, gap_micros in segments:
+        t0 = Fraction(temp_from)
+        t1 = Fraction(temp_to)
+        total_micros += gap_micros
+        if t0 == t1:
+            # 恒温段：整段时长作为该温度的点质量
+            point_mass[t0] = point_mass.get(t0, 0) + gap_micros
+            continue
+        # 变温段：在 (min, max) 上均匀分布，密度 = 时长 / 温差（微秒每 ℃）
+        lo, hi = (t0, t1) if t0 < t1 else (t1, t0)
+        density = Fraction(gap_micros) / (hi - lo)
+        delta[lo] = delta.get(lo, Fraction(0)) + density
+        delta[hi] = delta.get(hi, Fraction(0)) - density
+
+    if total_micros <= 0:
+        return None, 0
+
+    target = Fraction(total_micros, 2)
+    cumulative = Fraction(0)
+    rho = Fraction(0)  # 当前断点右侧开区间上的连续密度
+    previous: Fraction | None = None
+
+    for x in sorted(set(point_mass) | set(delta)):
+        # 先累计上一断点到当前断点之间的连续部分（密度恒定）
+        if previous is not None and rho > 0:
+            span_weight = rho * (x - previous)
+            if cumulative + span_weight >= target:
+                return previous + (target - cumulative) / rho, total_micros
+            cumulative += span_weight
+        # 再加上当前温度处的点质量（恒温段时长）；点质量在 CDF 上是一次跳变
+        mass = point_mass.get(x, 0)
+        if mass and cumulative + mass >= target:
+            return x, total_micros
+        cumulative += mass
+        # 此后进入 (x, 下一断点) 区间，更新该区间上的连续密度
+        rho += delta.get(x, Fraction(0))
+        previous = x
+
+    # 理论上不可达：总权重在最后一个断点处必然累计到 total_micros
+    return None, total_micros
+
+
+def temperature_median(
+    db: Session,
+    box_code: str,
+    seq_from: int,
+    seq_to: int,
+    max_gap_seconds: float,
+) -> schemas.TemperatureMedianResult | None:
+    """区间内按段时长加权的温度中位数，基于 clock-audit 同款校正时间。
+
+    - 相邻事件（按 seq 升序，缺号不补点）间温度视为线性变化；
+      仅校正后时长 > 0 且不超过 max_gap_seconds 的段计入分布
+    - 有效段的每一瞬间按持续时间计入温度分布，恒温段时长作为该温度的点质量；
+      中位数为累计时间占比首次达到一半的最低温度
+    - 只在查询时即时计算，不改动任何原始记录；补报后重查即重算
+    - 箱号不存在返回 None，由路由层转 404；
+      区间无事件或无有效段时中位数为 null、总秒数为 0
+    """
+    events = _events_in_range(db, box_code, seq_from, seq_to)
+    if events is None:
+        return None
+
+    corrected, _ = _isotonic_suggestions(events)
+
+    valid_segments: list[tuple[float, float, int]] = []
+    skipped = 0
+    for i in range(len(events) - 1):
+        gap_micros = corrected[i + 1] - corrected[i]
+        # 校正时间非递减，间隔只会 >= 0；为 0（同块）或超上限的段不计入
+        if gap_micros <= 0 or gap_micros / 1_000_000 > max_gap_seconds:
+            skipped += 1
+            continue
+        valid_segments.append(
+            (events[i].temperature, events[i + 1].temperature, gap_micros)
+        )
+
+    median_frac, total_micros = _time_weighted_median(valid_segments)
+
+    return schemas.TemperatureMedianResult(
+        box_code=box_code,
+        seq_from=seq_from,
+        seq_to=seq_to,
+        max_gap_seconds=max_gap_seconds,
+        event_count=len(events),
+        segment_count=len(valid_segments),
+        skipped_segment_count=skipped,
+        total_seconds=total_micros / 1_000_000,
+        median_temperature=None if median_frac is None else float(median_frac),
     )
 
 

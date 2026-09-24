@@ -183,6 +183,44 @@ def get_box_heat_exposure(
 
 
 @app.get(
+    "/boxes/{box_code}/temperature-median",
+    tags=["boxes"],
+    response_model=schemas.TemperatureMedianResult,
+    summary="区间时间加权温度中位数（线性插值 + 保序校正时间，不改原始记录）",
+)
+def get_box_temperature_median(
+    box_code: str,
+    db: DbSession,
+    seq_from: Annotated[int, Query(ge=0, description="起始序号（含）")],
+    seq_to: Annotated[int, Query(ge=0, description="结束序号（含）")],
+    max_gap_seconds: Annotated[
+        float,
+        Query(
+            gt=0,
+            allow_inf_nan=False,
+            description="允许计入的最大相邻校正间隔（秒，正数）；间隔为零或超过它的段不计入",
+        ),
+    ],
+) -> schemas.TemperatureMedianResult:
+    if seq_from > seq_to:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "invalid_range",
+                "message": f"seq_from({seq_from}) 不能大于 seq_to({seq_to})",
+                "seq_from": seq_from,
+                "seq_to": seq_to,
+            },
+        )
+    result = services.temperature_median(
+        db, box_code.strip(), seq_from, seq_to, max_gap_seconds
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail={"error": "box_not_found", "box_code": box_code})
+    return result
+
+
+@app.get(
     "/boxes/{box_code}/trajectory-compression",
     tags=["boxes"],
     response_model=schemas.TrajectoryCompressionResult,
